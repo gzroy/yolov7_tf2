@@ -500,3 +500,117 @@ def tf_predict_func(predictions, labels, imgs_hw, imgs_id):
         imgs_info = imgs_info.write(0, tf.dtypes.cast(tf.zeros(shape=[1,2]), tf.int32))
 
     return boxes_result.concat(), imgs_info.concat()
+
+@tf.function(
+    input_signature=([
+        tf.TensorSpec(shape=[None, na, 8400, 85], dtype=tf.float32),
+        tf.TensorSpec(shape=[None, None, 5], dtype=tf.float32),
+        tf.TensorSpec(shape=[None, 2], dtype=tf.int32),
+        tf.TensorSpec(shape=[None], dtype=tf.int32),
+        tf.TensorSpec(shape=[], dtype=tf.float32),
+        tf.TensorSpec(shape=[], dtype=tf.float32),
+    ])
+)
+def tf_predict_func_v2(predictions, labels, imgs_hw, imgs_id, confidence_threshold=0.25, iou_threshold=0.65):
+    grids = img_size // stride
+    batch_size = tf.shape(predictions)[0]
+    max_nms = 30000
+    max_det = 300
+    all_predict_result = tf.TensorArray(tf.float32, size=nl, dynamic_size=False) 
+    boxes_result = tf.TensorArray(tf.float32, size=0, dynamic_size=True) 
+    imgs_info = tf.TensorArray(tf.int32, size=0, dynamic_size=True)
+    for i in tf.range(nl):
+        grid = tf.gather(grids, i)
+        grid_x, grid_y = tf.meshgrid(tf.range(grid, dtype=tf.float32), tf.range(grid, dtype=tf.float32))
+        grid_x = tf.reshape(grid_x, [-1, 1])
+        grid_y = tf.reshape(grid_y, [-1, 1])
+        #grid_xy = tf.concat([grid_y, grid_x], axis=-1)
+        grid_xy = tf.concat([grid_x, grid_y], axis=-1)
+        grid_xy = tf.reshape(grid_xy, [1,1,-1,2])
+        layer_mask = layer_no_constant[...,0]==i
+        #grid = tf.gather(grids, i)
+        predict_layer = tf.boolean_mask(predictions, layer_mask)
+        predict_layer = tf.reshape(predict_layer, [batch_size, na, -1, 85])
+        predict_conf = tf.math.sigmoid(predict_layer[...,4:5])
+        predict_xy = (tf.math.sigmoid(predict_layer[...,:2])*2-0.5 + \
+            tf.dtypes.cast(grid_xy,tf.float32))*tf.dtypes.cast(tf.gather(stride, i), tf.float32)
+        predict_wh = (tf.math.sigmoid(predict_layer[...,2:4])*2)**2*\
+            tf.reshape(tf.gather(anchors_constant,i), [1,na,1,2])*\
+            tf.dtypes.cast(tf.gather(stride, i), tf.float32)
+        predict_xywh = tf.concat([predict_xy, predict_wh], axis=-1)
+        predict_xyxy = xywh2xyxy(predict_xywh)
+        predict_cls_conf = tf.nn.sigmoid(predict_layer[...,5:]) * predict_conf
+        batch_no = tf.expand_dims(tf.tile(tf.gather(batch_no_constant, tf.range(batch_size)), [1,na,grid*grid]), -1)
+        #predict_result = tf.concat([batch_no, predict_conf, predict_xyxy, predict_cls_conf], axis=-1)
+        predict_result = tf.concat([batch_no, predict_xyxy], axis=-1)
+        mask = predict_conf[..., 0] > confidence_threshold
+        predict_result = tf.boolean_mask(predict_result, mask)
+        predict_cls_conf = tf.boolean_mask(predict_cls_conf, mask)
+        mask = predict_cls_conf[..., 0:] > confidence_threshold
+        mask_indices = tf.where(mask)
+        predict_result = tf.gather_nd(predict_result, mask_indices[..., :-1])
+        predict_cls = tf.dtypes.cast(mask_indices[..., -1:], tf.float32)
+        predict_score = tf.expand_dims(tf.gather_nd(predict_cls_conf, mask_indices), axis=-1)
+        predict_result = tf.concat([predict_result, predict_cls, predict_score], axis=-1)
+        if tf.shape(predict_result)[0] > 0:
+            all_predict_result = all_predict_result.write(i, predict_result)
+        else:
+            all_predict_result = all_predict_result.write(i, tf.zeros(shape=[1,7]))
+    all_predict_result = all_predict_result.concat()
+          
+    for i in tf.range(batch_size):
+        batch_mask = tf.math.logical_and(
+            all_predict_result[...,0]==tf.dtypes.cast(i, tf.float32),
+            all_predict_result[...,-1]>0
+        )
+        predict_true_box = tf.boolean_mask(all_predict_result, batch_mask)
+        if tf.shape(predict_true_box)[0]==0:
+            continue
+        if tf.shape(predict_true_box)[0]>max_nms:
+            sort_result = tf.math.top_k(predict_true_box[..., -1], k=max_nms, sorted=False)
+            predict_true_box = tf.gather(predict_true_box, sort_result.indices)
+        boxes_result_img = tf.TensorArray(tf.float32, size=0, dynamic_size=True) 
+        original_hw = tf.dtypes.cast(tf.gather(imgs_hw, i), tf.float32)
+        ratio = tf.dtypes.cast(tf.reduce_max(original_hw/img_size), tf.float32)
+        predict_classes, _ = tf.unique(predict_true_box[:,5])
+        #predict_classes_list = tf.unstack(predict_classes)
+        #for class_id in predict_classes_list:
+        for j in tf.range(tf.shape(predict_classes)[0]):
+            #class_mask = tf.math.equal(predict_true_box[:, 6], class_id)
+            class_mask = tf.math.equal(predict_true_box[:, 5], tf.gather(predict_classes, j))
+            predict_true_box_class = tf.boolean_mask(predict_true_box, class_mask)
+            predict_true_box_xy = predict_true_box_class[:, 1:5]
+            #predict_true_box_score = predict_true_box_class[:, 7]*predict_true_box_class[:, 1]
+            predict_true_box_score = predict_true_box_class[:, -1]
+            selected_indices = tf.image.non_max_suppression(
+                predict_true_box_xy,
+                predict_true_box_score,
+                max_det,
+                iou_threshold=iou_threshold,
+                score_threshold=confidence_threshold
+            )
+            #Shape [box_num, 7]
+            selected_boxes = tf.gather(predict_true_box_class, selected_indices) 
+            #boxes_result = boxes_result.write(boxes_result.size(), selected_boxes)
+            boxes_xyxy = selected_boxes[:,1:5]*ratio
+            boxes_x1 = tf.clip_by_value(boxes_xyxy[:,0:1], 0., original_hw[1])
+            boxes_x2 = tf.clip_by_value(boxes_xyxy[:,2:3], 0., original_hw[1])
+            boxes_y1 = tf.clip_by_value(boxes_xyxy[:,1:2], 0., original_hw[0])
+            boxes_y2 = tf.clip_by_value(boxes_xyxy[:,3:4], 0., original_hw[0])
+            boxes_w = boxes_x2 - boxes_x1
+            boxes_h = boxes_y2 - boxes_y1
+            boxes = tf.concat([selected_boxes[:,0:1], selected_boxes[:,5:6], boxes_x1, boxes_y1, boxes_w, boxes_h, selected_boxes[:,-1:]], axis=-1)
+            boxes_result_img = boxes_result_img.write(boxes_result_img.size(), boxes)
+        boxes_result_img = boxes_result_img.concat()
+        if tf.shape(boxes_result_img)[0]>max_det:
+            sort_boxes_result = tf.math.top_k(boxes_result_img[..., -1], k=max_det, sorted=False)
+            boxes_result_img = tf.gather(boxes_result_img, sort_boxes_result.indices)
+        boxes_result = boxes_result.write(boxes_result.size(), boxes_result_img)
+        img_id = tf.gather(imgs_id, i)
+        imgs_info = imgs_info.write(imgs_info.size(), tf.reshape(tf.stack([i, img_id]), [-1,2]))
+    if boxes_result.size()==0:
+        boxes_result = boxes_result.write(0, tf.zeros(shape=[1,7]))
+    if imgs_info.size()==0:
+        imgs_info = imgs_info.write(0, tf.dtypes.cast(tf.zeros(shape=[1,2]), tf.int32))
+
+    return boxes_result.concat(), imgs_info.concat()

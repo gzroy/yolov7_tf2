@@ -283,7 +283,7 @@ if __name__ == '__main__':
         result_json = []
         for imgs, labels, imgs_hw, imgs_id in tqdm(dataset_val):
             predictions = model(imgs, training=False)
-            predict_results, imgs_info = tf_predict_func(predictions, labels, imgs_hw, imgs_id)
+            predict_results, imgs_info = tf_predict_func_v2(predictions, labels, imgs_hw, imgs_id, 0.001, 0.65)
             results = predict_results.numpy()
             for i in range(results.shape[0]):
                 item = results[i]
@@ -292,10 +292,7 @@ if __name__ == '__main__':
                 result['category_id'] = cocoid_mapping_labels[int(item[6])]
                 result['bbox'] = item[2:6].tolist()
                 result['bbox'] = [int(a*10)/10 for a in result['bbox']]
-                result['score'] = int(item[1]*item[7]*1000)/1000
-                #result['score'] = int(item[1]*1000)/1000
-                #result['conf'] = str(int(item[1]*1000)/1000)
-                #result['prop'] = str(int(item[7]*1000)/1000)
+                result['score'] = int(item[6]*1000)/1000
                 if result['score'] == 0:
                     continue
                 result_json.append(result)
@@ -328,7 +325,7 @@ if __name__ == '__main__':
                 img_filename = val_image_dir + '/' + filename+'.jpg'
                 img = cv2.imread(img_filename)
                 for item in results:
-                    if item['image_id']==imgid:
+                    if item['image_id']==imgid and item['score']>(0.25*0.65):
                         bbox = []
                         bbox_tmp = item['bbox']
                         bbox.append(int(bbox_tmp[0]))
