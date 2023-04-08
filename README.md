@@ -11,4 +11,5 @@ Run python train.py --startepoch 0 --numepoch 1 --stepepoch 3700 to train the mo
 Run python train.py --resume 'training_ckpt-1' --startepoch 1 --numepoch 1 --stepepoch 3700 to continue training.
 
 ## Test on the input images
-To be implement later...
+Store the images to detect in a folder, then run the below command, the detection result images will store in the output folder.
+Run python detect.py --ckpt 'training_ckpt-1' --input 'imgdir_fordetect/' --output 'imgdir_foroutput'
